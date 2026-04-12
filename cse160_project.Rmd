@@ -1,0 +1,20 @@
+---
+title: "CDC Chronic Disease Indicators - CVD Prevalence Project"
+author: "Lenio, Novick, Tanveer, Thompson"
+date: "12 April 2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1. Load & Cache
+
+The raw dataset is large (~300k rows). We load it once and cache it so
+subsequent knits skip the file read entirely.
+
+```{r load, cache=TRUE, cache.path="cache/"}
+raw <- read.csv("U.S._Chronic_Disease_Indicators.csv", stringsAsFactors = FALSE)
+cat("Loaded:", nrow(raw), "rows,", ncol(raw), "columns\n")
+```
