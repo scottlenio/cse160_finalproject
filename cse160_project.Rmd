@@ -9,6 +9,12 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+```{r libraries, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
 ## 1. Load & Cache
 
 The raw dataset is large (~300k rows). We load it once and cache it so
@@ -17,4 +23,160 @@ subsequent knits skip the file read entirely.
 ```{r load, cache=TRUE, cache.path="cache/"}
 raw <- read.csv("U.S._Chronic_Disease_Indicators.csv", stringsAsFactors = FALSE)
 cat("Loaded:", nrow(raw), "rows,", ncol(raw), "columns\n")
+```
+
+## 2. Preprocessing
+
+### 2a. Drop Sparse & Unnecessary Columns
+
+Keep only the columns needed for modeling. The secondary stratification fields
+(`Stratification2/3`, `ResponseID`, ID columns, etc.) are empty or near-empty
+across the full dataset and are dropped here.
+
+```{r drop-columns, cache=TRUE, cache.path="cache/", dependson="load"}
+clean <- raw %>%
+  select(
+    YearStart, YearEnd, LocationAbbr,
+    Topic, Question, QuestionID,
+    DataValueType, DataValue,
+    LowConfidenceLimit, HighConfidenceLimit,
+    StratificationCategory1, Stratification1
+  )
+cat("Columns kept:", ncol(clean), "\n")
+cat("Rows:", nrow(clean), "\n")
+```
+
+### 2b. Remove Suppressed Cells
+
+Some cells have no `DataValue` because the sample was too small to report.
+These are removed rather than imputed, as they represent structural missingness.
+
+```{r filter-suppress, cache=TRUE, cache.path="cache/", dependson="drop-columns"}
+clean <- clean %>% filter(!is.na(DataValue))
+cat("Rows after removing suppressed values:", nrow(clean), "\n")
+cat("Remaining NAs in DataValue:", sum(is.na(clean$DataValue)), "\n")
+```
+
+### 2c. Filter to Crude Prevalence
+
+The dataset mixes rates, counts, percentages, and means across different
+`DataValueType` values. Filtering to `"Crude Prevalence"` keeps only
+percentage-of-population measures, which are directly comparable across
+indicators and align with our target variable definition.
+
+```{r filter-type, cache=TRUE, cache.path="cache/", dependson="filter-suppress"}
+clean <- clean %>% filter(DataValueType == "Crude Prevalence")
+cat("Rows after filtering to Crude Prevalence:", nrow(clean), "\n")
+cat("DataValueTypes remaining:", unique(clean$DataValueType), "\n")
+```
+
+### 2d. Align Year Ranges
+
+Some records span multiple years (e.g., 2015–2019 rolling averages). We assign
+each record to its `YearStart` as a single year key so all records can be
+joined on a consistent time dimension.
+
+```{r year-align, cache=TRUE, cache.path="cache/", dependson="filter-type"}
+clean <- clean %>%
+  mutate(Year = YearStart) %>%
+  select(-YearStart, -YearEnd)
+cat("Year range:", range(clean$Year), "\n")
+```
+
+### 2e. Filter to CVD & Risk Factor Topics
+
+We keep Cardiovascular Disease records (which contain our target variable,
+CVD01 — high blood pressure prevalence) and four established CVD risk factor
+topics: Tobacco, Diabetes, Alcohol, and Nutrition/Physical Activity/Weight
+Status.
+
+```{r filter-topics, cache=TRUE, cache.path="cache/", dependson="year-align"}
+cvd_risk_topics <- c(
+  "Cardiovascular Disease",
+  "Tobacco",
+  "Diabetes",
+  "Alcohol",
+  "Nutrition, Physical Activity, and Weight Status"
+)
+clean <- clean %>% filter(Topic %in% cvd_risk_topics)
+cat("Rows after filtering to CVD + risk factor topics:", nrow(clean), "\n")
+cat("Topics retained:\n")
+print(table(clean$Topic))
+```
+
+### 2f. Pivot Long to Wide
+
+Currently each row is one indicator measurement. We pivot to wide format so
+each row represents a complete profile for a given state, year, and demographic
+group. `QuestionID` becomes the column name; duplicate key combinations are
+collapsed by taking the mean.
+
+```{r pivot-wide, cache=TRUE, cache.path="cache/", dependson="filter-topics"}
+wide <- clean %>%
+  select(LocationAbbr, Year, Stratification1, QuestionID, DataValue) %>%
+  pivot_wider(
+    names_from  = QuestionID,
+    values_from = DataValue,
+    values_fn   = mean
+  )
+cat("Wide format dimensions:", dim(wide), "\n")
+cat("Columns:", names(wide), "\n")
+```
+
+### 2g. Handle Missing Values After Pivot
+
+After pivoting, cells with no recorded measurement become `NA`. We:
+1. Drop any column where more than 50% of values are `NA` (indicator not
+   broadly reported)
+2. Drop rows where the target column (`CVD01`) is `NA`
+3. Impute remaining feature `NA`s with the column median
+
+```{r missing-values, cache=TRUE, cache.path="cache/", dependson="pivot-wide"}
+# 1. Drop rows with no target value first, before any column pruning
+#    (CVD01 = High blood pressure prevalence)
+wide <- wide %>% filter(!is.na(.data[["CVD01"]]))
+cat("Rows after dropping NA target rows:", nrow(wide), "\n")
+
+# 2. Drop columns with >50% NA (target and key cols are protected by step 1)
+wide <- wide %>% select(where(~ mean(is.na(.)) <= 0.5))
+cat("Columns after dropping sparse cols:", ncol(wide), "\n")
+
+# 3. Impute remaining NAs with column median
+wide <- wide %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+cat("Remaining NAs after imputation:", sum(is.na(wide)), "\n")
+```
+
+## 3. Target & Feature Separation
+
+`CVD01` ("High blood pressure among adults", Crude Prevalence %) is used as
+our CVD prevalence proxy — it is the most broadly reported CVD prevalence
+measure in the dataset. The remaining numeric columns from CVD risk factor
+topics serve as predictive features.
+
+```{r target-features, dependson="missing-values"}
+cvd_target <- "CVD01"
+feature_cols <- setdiff(names(wide), c("LocationAbbr", "Year", "Stratification1", cvd_target))
+
+cat("Target variable:", cvd_target,
+    "— High blood pressure among adults (Crude Prevalence %)\n")
+cat("Number of feature columns:", length(feature_cols), "\n")
+cat("Feature columns:\n")
+print(feature_cols)
+
+# Quick summary of target
+summary(wide[[cvd_target]])
+```
+
+## 4. Train / Test Split
+
+```{r train-test-split, dependson="missing-values"}
+set.seed(160)
+train_idx <- sample(nrow(wide), 0.8 * nrow(wide))
+train <- wide[train_idx, ]
+test  <- wide[-train_idx, ]
+
+cat("Training rows:", nrow(train), "\n")
+cat("Test rows:    ", nrow(test), "\n")
+cat("Split check — total:", nrow(train) + nrow(test), "== wide rows:", nrow(wide), "\n")
 ```
