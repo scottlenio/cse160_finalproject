@@ -57,16 +57,20 @@ cat("Rows after removing suppressed values:", nrow(clean), "\n")
 cat("Remaining NAs in DataValue:", sum(is.na(clean$DataValue)), "\n")
 ```
 
-### 2c. Filter to Crude Prevalence
+### 2c. Filter to Relevant Data Value Types
 
-The dataset mixes rates, counts, percentages, and means across different
-`DataValueType` values. Filtering to `"Crude Prevalence"` keeps only
-percentage-of-population measures, which are directly comparable across
-indicators and align with our target variable definition.
+Feature indicators (tobacco, diabetes, obesity, CVD conditions) are reported as
+`"Crude Prevalence"` (% of population). The target indicators CVD08 and CVD09
+(coronary heart disease and all heart disease mortality) are reported as
+`"Crude Rate"` (deaths per 100k). We keep both types and drop everything else.
 
 ```{r filter-type, cache=TRUE, cache.path="cache/", dependson="filter-suppress"}
-clean <- clean %>% filter(DataValueType == "Crude Prevalence")
-cat("Rows after filtering to Crude Prevalence:", nrow(clean), "\n")
+clean <- clean %>%
+  filter(
+    DataValueType == "Crude Prevalence" |
+    (QuestionID %in% c("CVD08", "CVD09") & DataValueType == "Crude Rate")
+  )
+cat("Rows after filtering to relevant types:", nrow(clean), "\n")
 cat("DataValueTypes remaining:", unique(clean$DataValueType), "\n")
 ```
 
@@ -85,10 +89,10 @@ cat("Year range:", range(clean$Year), "\n")
 
 ### 2e. Filter to CVD & Risk Factor Topics
 
-We keep Cardiovascular Disease records (which contain our target variable,
-CVD01 — high blood pressure prevalence) and four established CVD risk factor
-topics: Tobacco, Diabetes, Alcohol, and Nutrition/Physical Activity/Weight
-Status.
+We keep Cardiovascular Disease records (which contain our target variables
+CVD08/CVD09 — heart disease mortality rates — and CVD condition prevalence
+features) and four established CVD risk factor topics: Tobacco, Diabetes,
+Alcohol, and Nutrition/Physical Activity/Weight Status.
 
 ```{r filter-topics, cache=TRUE, cache.path="cache/", dependson="year-align"}
 cvd_risk_topics <- c(
@@ -126,15 +130,16 @@ cat("Columns:", names(wide), "\n")
 ### 2g. Handle Missing Values After Pivot
 
 After pivoting, cells with no recorded measurement become `NA`. We:
-1. Drop any column where more than 50% of values are `NA` (indicator not
+1. Drop rows where the target column (`CVD09`) is `NA` (this also removes the
+   "Age 18-44" prevalence rows that have no matching "Age 0-44" mortality rows)
+2. Drop any column where more than 50% of values are `NA` (indicator not
    broadly reported)
-2. Drop rows where the target column (`CVD01`) is `NA`
 3. Impute remaining feature `NA`s with the column median
 
 ```{r missing-values, cache=TRUE, cache.path="cache/", dependson="pivot-wide"}
 # 1. Drop rows with no target value first, before any column pruning
-#    (CVD01 = High blood pressure prevalence)
-wide <- wide %>% filter(!is.na(.data[["CVD01"]]))
+#    (CVD09 = Diseases of the heart mortality, Crude Rate per 100k)
+wide <- wide %>% filter(!is.na(.data[["CVD09"]]))
 cat("Rows after dropping NA target rows:", nrow(wide), "\n")
 
 # 2. Drop columns with >50% NA (target and key cols are protected by step 1)
@@ -149,17 +154,18 @@ cat("Remaining NAs after imputation:", sum(is.na(wide)), "\n")
 
 ## 3. Target & Feature Separation
 
-`CVD01` ("High blood pressure among adults", Crude Prevalence %) is used as
-our CVD prevalence proxy — it is the most broadly reported CVD prevalence
-measure in the dataset. The remaining numeric columns from CVD risk factor
-topics serve as predictive features.
+`CVD09` ("Diseases of the heart mortality among all people", Crude Rate per
+100k) is the target variable. It captures broad cardiovascular mortality and
+has 3 years of coverage (2019–2021). `CVD08` (coronary heart disease mortality
+specifically) is retained as a feature alongside CVD condition prevalence
+indicators (CVD01–CVD04) and the behavioral risk factor indicators.
 
 ```{r target-features, dependson="missing-values"}
-cvd_target <- "CVD01"
+cvd_target <- "CVD09"
 feature_cols <- setdiff(names(wide), c("LocationAbbr", "Year", "Stratification1", cvd_target))
 
 cat("Target variable:", cvd_target,
-    "— High blood pressure among adults (Crude Prevalence %)\n")
+    "— Diseases of the heart mortality, Crude Rate per 100k\n")
 cat("Number of feature columns:", length(feature_cols), "\n")
 cat("Feature columns:\n")
 print(feature_cols)
