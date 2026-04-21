@@ -125,3 +125,34 @@ Features that may be present after preprocessing (columns with >50% NA are dropp
 - **Demographic rows are not independent.** Overall, Male, Female, and race/ethnicity rows for the same location/year are derived from the same population. Consider whether to model only `Overall` rows or account for this structure.
 - **Median imputation was applied** to feature NAs after the pivot. Imputed values are population medians, not state-specific estimates.
 - **Territorial data is limited.** GU, PR, and VI were dropped because CVD09 mortality data was not reported for them.
+
+
+## Modeling
+
+Two regression models are applied to predict `CVD09` (heart disease mortality crude rate per 100,000 people).
+
+### 1. Multiple Linear Regression (OLS)
+
+A standard multiple linear regression is fit using all feature columns retained after preprocessing. This serves as the baseline model and satisfies the original project proposal's stated method.
+
+Required packages: No additional packages beyond base R.
+
+Limitations: Correlated features such as tobacco use, obesity, and diabetes produce unstable coefficients. With roughly 30 features and no regularization the model is also prone to overfitting.
+
+### 2. Ridge Regression
+
+Ridge regression extends OLS by adding an L2 penalty term to the loss function. This shrinks correlated coefficients proportionally rather than arbitrarily, producing more stable estimates. The optimal lambda is selected via 10-fold cross-validation using `cv.glmnet`.
+
+Required packages: `glmnet`
+
+Key choices: `alpha = 0` specifies Ridge (vs `alpha = 1` for Lasso). `lambda.min` is used for final predictions. CVD08 is retained as a feature but its outsized influence on the target is acknowledged in the write-up.
+
+### Model Evaluation
+
+Both models are evaluated on the held-out test set (20% of data) using RMSE (root mean squared error, in the same units as CVD09 — deaths per 100k) and R² (proportion of variance in CVD09 explained by the model). Residual vs Fitted and Actual vs Predicted plots are generated for both models, along with a side-by-side comparison chart in the knitted HTML output.
+
+### Required Packages (full list)
+
+```r
+install.packages(c("dplyr", "tidyr", "ggplot2", "glmnet"))
+```
