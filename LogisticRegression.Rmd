@@ -1,0 +1,108 @@
+---
+title: "R Notebook"
+author: "Amanda Novick"
+date: "April 15, 2026"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+##Logistic Regression
+cvd09_median <- median(wide$CVD09)
+cat("CVD09 median threshold:", round(cvd09_median, 2), "deaths per 100,000\n")
+
+train_log <- train %>%
+  mutate(CVD09_high = as.factor(ifelse(CVD09 > cvd09_median, 1, 0)))
+test_log <- test %>%
+  mutate(CVD09_high = as.factor(ifelse(CVD09 > cvd09_median, 1, 0)))
+
+cat("Training class distribution:\n"); print(table(train_log$CVD09_high))
+cat("Test class distribution:\n");     print(table(test_log$CVD09_high))
+```
+
+### 8b. Fit Logistic Regression
+
+```{r}
+log_formula <- as.formula(
+  paste("CVD09_high ~", paste(feature_cols, collapse = " + "))
+)
+
+log_model <- glm(log_formula, data = train_log,
+                 family  = binomial,
+                 control = glm.control(maxit = 100))
+
+summary(log_model)
+```
+
+### 8c. Evaluate
+
+```{r}
+log_prob <- predict(log_model, newdata = test_log, type = "response")
+log_pred <- as.factor(ifelse(log_prob > 0.5, 1, 0))
+
+conf_mat <- table(Predicted = log_pred, Actual = test_log$CVD09_high)
+cat("Confusion Matrix:\n"); print(conf_mat)
+
+log_accuracy  <- mean(log_pred == test_log$CVD09_high)
+tp            <- conf_mat["1", "1"]
+fp            <- conf_mat["1", "0"]
+fn            <- conf_mat["0", "1"]
+log_precision <- tp / (tp + fp)
+log_recall    <- tp / (tp + fn)
+log_f1        <- 2 * log_precision * log_recall / (log_precision + log_recall)
+
+cat("\nAccuracy: ",  round(log_accuracy,  3), "\n")
+cat("Precision:",   round(log_precision, 3), "\n")
+cat("Recall:   ",   round(log_recall,    3), "\n")
+cat("F1 Score: ",   round(log_f1,        3), "\n")
+```
+
+### 8d. Visualize
+
+```{r}
+log_results <- data.frame(
+  Probability = log_prob,
+  Predicted   = log_pred,
+  Actual      = test_log$CVD09_high
+)
+
+ggplot(log_results, aes(x = Probability, fill = Actual)) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity") +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "red") +
+  scale_fill_manual(
+    values = c("0" = "steelblue", "1" = "darkorange"),
+    labels = c("0" = "Low Mortality", "1" = "High Mortality")
+  ) +
+  labs(
+    title = "Logistic Regression — Predicted Probabilities by Actual Class",
+    x     = "Predicted Probability of High Mortality",
+    y     = "Count",
+    fill  = "Actual Class"
+  ) +
+  theme_minimal()
+
+as.data.frame(conf_mat) %>%
+  ggplot(aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 7, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(
+    title = "Logistic Regression — Confusion Matrix",
+    x     = "Actual Class",
+    y     = "Predicted Class"
+  ) +
+  theme_minimal()
+```
+
+
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
