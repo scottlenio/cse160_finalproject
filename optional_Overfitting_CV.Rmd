@@ -1,0 +1,176 @@
+---
+title: "Overfitting Check and Cross-Validation"
+author: "Lenio, Novick, Tanveer, Thompson"
+date: "12 April 2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+A single train/test split can be misleading — the test set might be
+accidentally easy or hard depending on which rows were sampled. This notebook
+checks for overfitting by comparing training vs test performance, then adds
+proper cross-validation for MLR and RF. Ridge already has 10-fold CV built in
+via `cv.glmnet`.
+
+**Requires:** Run `cse160_project.Rmd` first in the same session so that
+`wide`, `train`, `test`, `train_rf`, `feature_cols`, `mlr_model`, `mlr_formula`,
+`mlr_rmse`, `mlr_r2`, `cv_ridge`, `ridge_rmse`, `ridge_r2`, `rf_model`,
+`rf_accuracy`, `X_train`, `y_train`, and `y_test` are all available.
+
+```{r libraries, message=FALSE}
+library(ggplot2)
+```
+
+## Training vs Test Metrics — MLR and Ridge
+
+```{r overfit-train-metrics}
+mlr_train_pred <- predict(mlr_model, newdata = train)
+mlr_train_rmse <- sqrt(mean((mlr_train_pred - train$CVD09)^2))
+mlr_train_r2   <- 1 - sum((mlr_train_pred - train$CVD09)^2) /
+                      sum((train$CVD09 - mean(train$CVD09))^2)
+
+ridge_train_pred <- as.vector(predict(cv_ridge, newx = X_train, s = "lambda.min"))
+ridge_train_rmse <- sqrt(mean((ridge_train_pred - y_train)^2))
+ridge_train_r2   <- 1 - sum((ridge_train_pred - y_train)^2) /
+                        sum((y_train - mean(y_train))^2)
+
+train_test_reg <- data.frame(
+  Model  = c("MLR", "MLR", "Ridge", "Ridge"),
+  Split  = c("Train", "Test", "Train", "Test"),
+  RMSE   = c(mlr_train_rmse, mlr_rmse,   ridge_train_rmse, ridge_rmse),
+  R2     = c(mlr_train_r2,   mlr_r2,     ridge_train_r2,   ridge_r2)
+)
+print(train_test_reg)
+
+ggplot(train_test_reg, aes(x = Model, y = RMSE, fill = Split)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Train vs Test RMSE — MLR and Ridge",
+    x     = NULL,
+    y     = "RMSE (deaths per 100k)"
+  ) +
+  theme_minimal()
+
+ggplot(train_test_reg, aes(x = Model, y = R2, fill = Split)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Train vs Test R-Squared — MLR and Ridge",
+    x     = NULL,
+    y     = "R-Squared"
+  ) +
+  theme_minimal()
+```
+
+## Training vs Test Metrics — Random Forest
+
+RF predictions on the training set are expected to be near-perfect (trees
+memorize their training rows). The OOB error is the more honest in-sample
+estimate — each tree is tested only on rows it never saw during training.
+
+```{r overfit-rf-train}
+rf_train_pred     <- predict(rf_model, newdata = train_rf)
+rf_train_accuracy <- mean(rf_train_pred == train_rf$CVD09_range)
+rf_oob_accuracy   <- 1 - rf_model$err.rate[nrow(rf_model$err.rate), "OOB"]
+
+cat("RF Train accuracy (in-sample):  ", round(rf_train_accuracy, 3), "\n")
+cat("RF OOB accuracy  (CV estimate): ", round(rf_oob_accuracy,   3), "\n")
+cat("RF Test accuracy (held-out):    ", round(rf_accuracy,        3), "\n")
+
+rf_acc_comp <- data.frame(
+  Metric   = c("Train (in-sample)", "OOB (CV estimate)", "Test (held-out)"),
+  Accuracy = c(rf_train_accuracy, rf_oob_accuracy, rf_accuracy)
+)
+ggplot(rf_acc_comp, aes(x = Metric, y = Accuracy, fill = Metric)) +
+  geom_col(show.legend = FALSE) +
+  ylim(0, 1) +
+  labs(
+    title = "Random Forest — Train vs OOB vs Test Accuracy",
+    x     = NULL,
+    y     = "Accuracy"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 10, hjust = 1))
+```
+
+## 10-Fold Cross-Validation — MLR
+
+Runs 10-fold CV on the full `wide` dataset so every row gets used as a test
+observation exactly once. This gives a more stable RMSE estimate than a single
+split, and the standard deviation across folds shows how consistent the model
+is.
+
+```{r cv-mlr}
+set.seed(160)
+k        <- 10
+fold_ids <- sample(rep(1:k, length.out = nrow(wide)))
+
+cv_rmse_folds <- numeric(k)
+cv_r2_folds   <- numeric(k)
+
+for (i in 1:k) {
+  fold_train <- wide[fold_ids != i, ]
+  fold_test  <- wide[fold_ids == i, ]
+
+  fold_model <- lm(mlr_formula, data = fold_train)
+  fold_pred  <- predict(fold_model, newdata = fold_test)
+
+  cv_rmse_folds[i] <- sqrt(mean((fold_pred - fold_test$CVD09)^2, na.rm = TRUE))
+  cv_r2_folds[i]   <- 1 - sum((fold_pred - fold_test$CVD09)^2, na.rm = TRUE) /
+                          sum((fold_test$CVD09 - mean(fold_test$CVD09, na.rm = TRUE))^2,
+                              na.rm = TRUE)
+}
+
+cat("MLR 10-fold CV — RMSE per fold:\n")
+print(round(cv_rmse_folds, 3))
+cat("\nMean RMSE:", round(mean(cv_rmse_folds), 3),
+    " SD:", round(sd(cv_rmse_folds), 3), "\n")
+cat("Mean R2:  ", round(mean(cv_r2_folds),   3),
+    " SD:", round(sd(cv_r2_folds),   3), "\n")
+cat("\nSingle-split test RMSE for comparison:", round(mlr_rmse, 3), "\n")
+
+cv_fold_df <- data.frame(Fold = 1:k, RMSE = cv_rmse_folds)
+ggplot(cv_fold_df, aes(x = factor(Fold), y = RMSE)) +
+  geom_col(fill = "steelblue") +
+  geom_hline(yintercept = mean(cv_rmse_folds), linetype = "dashed", color = "red") +
+  labs(
+    title = "MLR — RMSE Across 10 CV Folds (dashed = mean)",
+    x     = "Fold",
+    y     = "RMSE (deaths per 100k)"
+  ) +
+  theme_minimal()
+```
+
+## Ridge — CV Error from glmnet
+
+Ridge CV was already run in the main notebook. The CV RMSE at the optimal
+lambda is extracted here and compared to the held-out test RMSE.
+
+```{r cv-ridge-check}
+ridge_cv_rmse <- sqrt(min(cv_ridge$cvm))
+
+cat("Ridge CV RMSE  (10-fold, lambda.min):", round(ridge_cv_rmse, 3), "\n")
+cat("Ridge Test RMSE (held-out):          ", round(ridge_rmse,    3), "\n")
+cat("Difference:                          ", round(abs(ridge_cv_rmse - ridge_rmse), 3), "\n")
+```
+
+## Summary
+
+```{r overfit-summary}
+cat("=== Regression Models (RMSE) ===\n")
+cat(sprintf("%-30s %8s %8s %8s\n", "Model", "Train", "CV", "Test"))
+cat(sprintf("%-30s %8.3f %8.3f %8.3f\n", "MLR",   mlr_train_rmse,   mean(cv_rmse_folds), mlr_rmse))
+cat(sprintf("%-30s %8.3f %8.3f %8.3f\n", "Ridge", ridge_train_rmse, ridge_cv_rmse,       ridge_rmse))
+
+cat("\n=== Random Forest (Accuracy) ===\n")
+cat(sprintf("%-30s %8s %8s %8s\n", "Model", "Train", "OOB", "Test"))
+cat(sprintf("%-30s %8.3f %8.3f %8.3f\n", "Random Forest",
+            rf_train_accuracy, rf_oob_accuracy, rf_accuracy))
+
+cat("\nInterpretation:\n")
+cat("- Train >> CV/OOB/Test suggests overfitting\n")
+cat("- CV/OOB close to Test suggests the single split was representative\n")
+cat("- Wide SD across MLR CV folds suggests sensitivity to which rows are held out\n")
+```

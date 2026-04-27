@@ -34,14 +34,14 @@ Keep only the columns needed for modeling. The secondary stratification fields
 across the full dataset and are dropped here.
 
 ```{r drop-columns, cache=TRUE, cache.path="cache/", dependson="load"}
-clean <- raw %>%
-  select(
-    YearStart, YearEnd, LocationAbbr,
-    Topic, Question, QuestionID,
-    DataValueType, DataValue,
-    LowConfidenceLimit, HighConfidenceLimit,
-    StratificationCategory1, Stratification1
-  )
+keep_cols <- c(
+  "YearStart", "YearEnd", "LocationAbbr",
+  "Topic", "Question", "QuestionID",
+  "DataValueType", "DataValue",
+  "LowConfidenceLimit", "HighConfidenceLimit",
+  "StratificationCategory1", "Stratification1"
+)
+clean <- raw[, keep_cols]
 cat("Columns kept:", ncol(clean), "\n")
 cat("Rows:", nrow(clean), "\n")
 ```
@@ -52,7 +52,7 @@ Some cells have no `DataValue` because the sample was too small to report.
 These are removed rather than imputed, as they represent structural missingness.
 
 ```{r filter-suppress, cache=TRUE, cache.path="cache/", dependson="drop-columns"}
-clean <- clean %>% filter(!is.na(DataValue))
+clean <- clean[!is.na(clean$DataValue), ]
 cat("Rows after removing suppressed values:", nrow(clean), "\n")
 cat("Remaining NAs in DataValue:", sum(is.na(clean$DataValue)), "\n")
 ```
@@ -60,30 +60,28 @@ cat("Remaining NAs in DataValue:", sum(is.na(clean$DataValue)), "\n")
 ### 2c. Filter to Relevant Data Value Types
 
 Feature indicators (tobacco, diabetes, obesity, CVD conditions) are reported as
-`"Crude Prevalence"` (% of population). The target indicators CVD08 and CVD09
+Crude Prevalence (proportion of population). The target indicators CVD08 and CVD09
 (coronary heart disease and all heart disease mortality) are reported as
-`"Crude Rate"` (deaths per 100k). We keep both types and drop everything else.
+Crude Rate (deaths per 100k). We keep both types and drop everything else.
 
 ```{r filter-type, cache=TRUE, cache.path="cache/", dependson="filter-suppress"}
-clean <- clean %>%
-  filter(
-    DataValueType == "Crude Prevalence" |
-    (QuestionID %in% c("CVD08", "CVD09") & DataValueType == "Crude Rate")
-  )
+is_crude_prev <- clean$DataValueType == "Crude Prevalence"
+is_cvd_rate   <- (clean$QuestionID == "CVD08" | clean$QuestionID == "CVD09") &
+                  clean$DataValueType == "Crude Rate"
+clean <- clean[is_crude_prev | is_cvd_rate, ]
 cat("Rows after filtering to relevant types:", nrow(clean), "\n")
 cat("DataValueTypes remaining:", unique(clean$DataValueType), "\n")
 ```
 
 ### 2d. Align Year Ranges
 
-Some records span multiple years (e.g., 2015–2019 rolling averages). We assign
+Some records span multiple years (e.g., 2015-2019 rolling averages). We assign
 each record to its `YearStart` as a single year key so all records can be
 joined on a consistent time dimension.
 
 ```{r year-align, cache=TRUE, cache.path="cache/", dependson="filter-type"}
-clean <- clean %>%
-  mutate(Year = YearStart) %>%
-  select(-YearStart, -YearEnd)
+clean$Year <- clean$YearStart
+clean <- clean[, setdiff(names(clean), c("YearStart", "YearEnd"))]
 cat("Year range:", range(clean$Year), "\n")
 ```
 
@@ -102,7 +100,7 @@ cvd_risk_topics <- c(
   "Alcohol",
   "Nutrition, Physical Activity, and Weight Status"
 )
-clean <- clean %>% filter(Topic %in% cvd_risk_topics)
+clean <- clean[is.element(clean$Topic, cvd_risk_topics), ]
 cat("Rows after filtering to CVD + risk factor topics:", nrow(clean), "\n")
 cat("Topics retained:\n")
 print(table(clean$Topic))
@@ -116,13 +114,13 @@ group. `QuestionID` becomes the column name; duplicate key combinations are
 collapsed by taking the mean.
 
 ```{r pivot-wide, cache=TRUE, cache.path="cache/", dependson="filter-topics"}
-wide <- clean %>%
-  select(LocationAbbr, Year, Stratification1, QuestionID, DataValue) %>%
-  pivot_wider(
-    names_from  = QuestionID,
-    values_from = DataValue,
-    values_fn   = mean
-  )
+sub_clean <- clean[, c("LocationAbbr", "Year", "Stratification1", "QuestionID", "DataValue")]
+wide <- pivot_wider(
+  sub_clean,
+  names_from  = QuestionID,
+  values_from = DataValue,
+  values_fn   = mean
+)
 cat("Wide format dimensions:", dim(wide), "\n")
 cat("Columns:", names(wide), "\n")
 ```
@@ -139,16 +137,22 @@ After pivoting, cells with no recorded measurement become `NA`. We:
 ```{r missing-values, cache=TRUE, cache.path="cache/", dependson="pivot-wide"}
 # 1. Drop rows with no target value first, before any column pruning
 #    (CVD09 = Diseases of the heart mortality, Crude Rate per 100k)
-wide <- wide %>% filter(!is.na(.data[["CVD09"]]))
+wide <- wide[!is.na(wide[["CVD09"]]), ]
 cat("Rows after dropping NA target rows:", nrow(wide), "\n")
 
 # 2. Drop columns with >50% NA (target and key cols are protected by step 1)
-wide <- wide %>% select(where(~ mean(is.na(.)) <= 0.5))
+na_fracs <- colMeans(is.na(wide))
+wide <- wide[, na_fracs <= 0.5]
 cat("Columns after dropping sparse cols:", ncol(wide), "\n")
 
 # 3. Impute remaining NAs with column median
-wide <- wide %>%
-  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+num_cols <- which(sapply(wide, is.numeric))
+for (col in names(wide)[num_cols]) {
+  na_idx <- is.na(wide[[col]])
+  if (any(na_idx)) {
+    wide[[col]][na_idx] <- median(wide[[col]], na.rm = TRUE)
+  }
+}
 cat("Remaining NAs after imputation:", sum(is.na(wide)), "\n")
 ```
 
@@ -371,3 +375,214 @@ ggplot(comparison_long, aes(x = Model, y = Value, fill = Model)) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 15, hjust = 1))
 ```
+
+
+## 8. Random Forest — Mortality Range Classification
+
+CVD09 mortality rates are split into five equal-frequency quintile bands
+(Very Low through Very High) using the full dataset distribution. The random
+forest then predicts which band a state/year/demographic row falls into.
+
+### 8a. Define Quintile Ranges
+
+```{r rf-setup, dependson="train-test-split"}
+cvd09_breaks <- quantile(wide$CVD09, probs = seq(0, 1, by = 0.2), na.rm = TRUE)
+range_labels <- c("Very Low", "Low", "Medium", "High", "Very High")
+
+train_rf <- train
+test_rf  <- test
+train_rf$CVD09_range <- cut(train_rf$CVD09, breaks = cvd09_breaks,
+                             labels = range_labels, include.lowest = TRUE)
+test_rf$CVD09_range  <- cut(test_rf$CVD09,  breaks = cvd09_breaks,
+                             labels = range_labels, include.lowest = TRUE)
+
+cat("Quintile break points (deaths per 100k):\n")
+print(round(cvd09_breaks, 1))
+cat("\nTraining class distribution:\n")
+print(table(train_rf$CVD09_range))
+cat("\nTest class distribution:\n")
+print(table(test_rf$CVD09_range))
+```
+
+### 8b. Fit Random Forest
+
+```{r rf-model, message=FALSE, dependson="rf-setup"}
+library(randomForest)
+set.seed(160)
+rf_formula <- as.formula(paste("CVD09_range ~", paste(feature_cols, collapse = " + ")))
+rf_model <- randomForest(rf_formula, data = train_rf, ntree = 500, importance = TRUE)
+print(rf_model)
+```
+
+### 8c. Evaluate
+
+```{r rf-evaluate, dependson="rf-model"}
+rf_pred     <- predict(rf_model, newdata = test_rf)
+conf_mat_rf <- table(Predicted = rf_pred, Actual = test_rf$CVD09_range)
+rf_accuracy <- mean(rf_pred == test_rf$CVD09_range)
+
+cat("Confusion Matrix:\n")
+print(conf_mat_rf)
+cat("\nOverall Accuracy:", round(rf_accuracy, 3), "\n")
+
+conf_df <- as.data.frame(conf_mat_rf)
+ggplot(conf_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "forestgreen") +
+  labs(
+    title = "Random Forest — Confusion Matrix",
+    x     = "Actual Range",
+    y     = "Predicted Range"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+### 8d. Variable Importance
+
+```{r rf-importance, dependson="rf-model"}
+rf_imp_raw <- importance(rf_model, type = 1)
+rf_imp_df  <- data.frame(
+  Feature    = rownames(rf_imp_raw),
+  Importance = rf_imp_raw[, 1]
+)
+rf_imp_df <- rf_imp_df[order(rf_imp_df$Importance, decreasing = TRUE), ]
+
+ggplot(rf_imp_df[1:min(15, nrow(rf_imp_df)), ],
+       aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "forestgreen") +
+  coord_flip() +
+  labs(
+    title = "Random Forest — Top 15 Features (Mean Decrease in Accuracy)",
+    x     = "Feature",
+    y     = "Mean Decrease in Accuracy"
+  ) +
+  theme_minimal()
+```
+
+
+## 9. Feature Importance — All Models
+
+Each model measures feature importance on a different scale, so we normalize
+each to [0, 1] before comparing. Sources:
+
+- **MLR**: absolute t-statistic (coefficient divided by its standard error)
+- **Ridge**: absolute shrunken coefficient (from Section 6)
+- **Logistic**: absolute z-statistic (`log_model` must be available — run `LogisticRegression.Rmd` first in the same session)
+- **Random Forest**: mean decrease in accuracy when a feature is permuted (from Section 8)
+
+Sections 6 and 8 already show Ridge and RF importance individually; this
+section adds MLR and Logistic plots, then combines all four into a consensus
+ranking.
+
+### 9a. MLR Feature Importance
+
+```{r importance-mlr, dependson="mlr-model"}
+mlr_coef_mat <- summary(mlr_model)$coefficients
+mlr_imp_df <- data.frame(
+  Feature    = rownames(mlr_coef_mat)[-1],
+  Importance = abs(mlr_coef_mat[-1, "t value"])
+)
+mlr_imp_df <- mlr_imp_df[order(mlr_imp_df$Importance, decreasing = TRUE), ]
+
+ggplot(mlr_imp_df[1:min(15, nrow(mlr_imp_df)), ],
+       aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "MLR — Top 15 Features by Absolute t-Statistic",
+    x     = "Feature",
+    y     = "Absolute t-Statistic"
+  ) +
+  theme_minimal()
+```
+
+### 9b. Logistic Regression Feature Importance
+
+```{r importance-logistic}
+if (!exists("log_model")) {
+  message("log_model not found — run LogisticRegression.Rmd in this session first. Skipping.")
+  log_imp_df <- data.frame(Feature = character(0), Importance = numeric(0))
+} else {
+  log_coef_mat <- summary(log_model)$coefficients
+  log_imp_df <- data.frame(
+    Feature    = rownames(log_coef_mat)[-1],
+    Importance = abs(log_coef_mat[-1, "z value"])
+  )
+  log_imp_df <- log_imp_df[!is.na(log_imp_df$Importance), ]
+  log_imp_df <- log_imp_df[order(log_imp_df$Importance, decreasing = TRUE), ]
+
+  print(
+    ggplot(log_imp_df[1:min(15, nrow(log_imp_df)), ],
+           aes(x = reorder(Feature, Importance), y = Importance)) +
+      geom_col(fill = "darkorange") +
+      coord_flip() +
+      labs(
+        title = "Logistic Regression — Top 15 Features by Absolute z-Statistic",
+        x     = "Feature",
+        y     = "Absolute z-Statistic"
+      ) +
+      theme_minimal()
+  )
+}
+```
+
+### 9c. Consensus Ranking
+
+```{r importance-consensus, dependson=c("mlr-model", "ridge-cv", "rf-model")}
+normalize_imp <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (rng[1] == rng[2]) return(rep(0, length(x)))
+  (x - rng[1]) / (rng[2] - rng[1])
+}
+
+mlr_norm <- data.frame(
+  Feature = mlr_imp_df$Feature,
+  MLR     = normalize_imp(mlr_imp_df$Importance)
+)
+
+ridge_coef_vec <- as.vector(coef(cv_ridge, s = "lambda.min"))[-1]
+ridge_norm <- data.frame(
+  Feature = rownames(coef(cv_ridge, s = "lambda.min"))[-1],
+  Ridge   = normalize_imp(abs(ridge_coef_vec))
+)
+
+if (nrow(log_imp_df) > 0) {
+  log_norm <- data.frame(
+    Feature  = log_imp_df$Feature,
+    Logistic = normalize_imp(log_imp_df$Importance)
+  )
+} else {
+  log_norm <- data.frame(Feature = character(0), Logistic = numeric(0))
+}
+
+rf_norm <- data.frame(
+  Feature = rf_imp_df$Feature,
+  RF      = normalize_imp(rf_imp_df$Importance)
+)
+
+imp_all <- merge(mlr_norm,  ridge_norm, by = "Feature", all = TRUE)
+imp_all <- merge(imp_all,   log_norm,   by = "Feature", all = TRUE)
+imp_all <- merge(imp_all,   rf_norm,    by = "Feature", all = TRUE)
+
+imp_all$Consensus <- rowMeans(
+  imp_all[, c("MLR", "Ridge", "Logistic", "RF")], na.rm = TRUE
+)
+imp_all <- imp_all[order(imp_all$Consensus, decreasing = TRUE), ]
+
+cat("Top 15 features by consensus importance:\n")
+print(imp_all[1:min(15, nrow(imp_all)), ])
+
+top15 <- imp_all[1:min(15, nrow(imp_all)), ]
+ggplot(top15, aes(x = reorder(Feature, Consensus), y = Consensus)) +
+  geom_col(fill = "purple4") +
+  coord_flip() +
+  labs(
+    title = "Consensus Feature Importance — Average Across All 4 Models",
+    x     = "Feature",
+    y     = "Mean Normalized Importance (0 to 1)"
+  ) +
+  theme_minimal()
+```
+

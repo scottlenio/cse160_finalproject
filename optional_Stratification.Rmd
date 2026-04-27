@@ -1,0 +1,196 @@
+---
+title: "Stratification — Adding Location and Demographics"
+author: "Lenio, Novick, Tanveer, Thompson"
+date: "12 April 2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The baseline models treat every row as an anonymous observation — they see
+indicator values but not which state or demographic group the row represents.
+This notebook first visualizes how CVD09 mortality differs across states and
+demographic groups, then adds `LocationAbbr` and `Stratification1` as explicit
+model inputs (with CVD08 excluded) to see whether knowing where and who
+improves predictions.
+
+**Requires:** Run `cse160_project.Rmd` and `CVD08_Ablation.Rmd` first in the
+same session so that `wide`, `train`, `test`, `train_rf`, `test_rf`,
+`feature_cols_no_cvd08`, `mlr_rmse`, `mlr_r2`, `ridge_rmse`, `ridge_r2`,
+`rf_accuracy`, `y_train`, and `y_test` are all available.
+
+```{r libraries, message=FALSE}
+library(ggplot2)
+library(glmnet)
+library(randomForest)
+```
+
+## CVD09 by Demographic Group
+
+```{r strat-explore-demo}
+cvd09_by_demo <- aggregate(CVD09 ~ Stratification1, data = wide,
+                            FUN = mean, na.rm = TRUE)
+cvd09_by_demo <- cvd09_by_demo[order(cvd09_by_demo$CVD09, decreasing = TRUE), ]
+
+ggplot(cvd09_by_demo, aes(x = reorder(Stratification1, CVD09), y = CVD09)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Mean CVD09 Mortality by Demographic Group",
+    x     = NULL,
+    y     = "Mean CVD09 (deaths per 100k)"
+  ) +
+  theme_minimal()
+```
+
+## CVD09 by State
+
+```{r strat-explore-state}
+cvd09_by_state <- aggregate(CVD09 ~ LocationAbbr, data = wide,
+                              FUN = mean, na.rm = TRUE)
+cvd09_by_state <- cvd09_by_state[order(cvd09_by_state$CVD09, decreasing = TRUE), ]
+
+ggplot(cvd09_by_state, aes(x = reorder(LocationAbbr, CVD09), y = CVD09)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Mean CVD09 Mortality by State",
+    x     = NULL,
+    y     = "Mean CVD09 (deaths per 100k)"
+  ) +
+  theme_minimal()
+```
+
+## Encode Stratification Variables
+
+`lm` and `randomForest` accept factors directly. For Ridge (`glmnet`) we need
+a numeric matrix, so we use `model.matrix` with factor levels fixed to the
+full dataset to guarantee train and test produce identical columns.
+
+```{r strat-encode}
+loc_levels   <- sort(unique(wide$LocationAbbr))
+strat_levels <- sort(unique(wide$Stratification1))
+
+train_f <- train
+test_f  <- test
+train_f$LocationAbbr    <- factor(train_f$LocationAbbr,    levels = loc_levels)
+train_f$Stratification1 <- factor(train_f$Stratification1, levels = strat_levels)
+test_f$LocationAbbr     <- factor(test_f$LocationAbbr,     levels = loc_levels)
+test_f$Stratification1  <- factor(test_f$Stratification1,  levels = strat_levels)
+
+mm_formula    <- as.formula(paste("~", paste(c(feature_cols_no_cvd08, "LocationAbbr", "Stratification1"),
+                                              collapse = " + ")))
+X_train_strat <- model.matrix(mm_formula, data = train_f)[, -1]
+X_test_strat  <- model.matrix(mm_formula, data = test_f)[, -1]
+
+train_rf_f <- train_rf
+test_rf_f  <- test_rf
+train_rf_f$LocationAbbr    <- factor(train_rf_f$LocationAbbr,    levels = loc_levels)
+train_rf_f$Stratification1 <- factor(train_rf_f$Stratification1, levels = strat_levels)
+test_rf_f$LocationAbbr     <- factor(test_rf_f$LocationAbbr,     levels = loc_levels)
+test_rf_f$Stratification1  <- factor(test_rf_f$Stratification1,  levels = strat_levels)
+
+cat("Dummy columns added for Ridge:", ncol(X_train_strat) - length(feature_cols_no_cvd08), "\n")
+cat("Total Ridge input columns:    ", ncol(X_train_strat), "\n")
+```
+
+## MLR with Stratification
+
+```{r strat-mlr}
+mlr_strat_formula <- as.formula(paste(
+  "CVD09 ~",
+  paste(c(feature_cols_no_cvd08, "LocationAbbr", "Stratification1"), collapse = " + ")
+))
+mlr_strat_model <- lm(mlr_strat_formula, data = train_f)
+mlr_strat_pred  <- predict(mlr_strat_model, newdata = test_f)
+
+mlr_strat_rmse <- sqrt(mean((mlr_strat_pred - test_f$CVD09)^2))
+mlr_strat_r2   <- 1 - sum((mlr_strat_pred - test_f$CVD09)^2) /
+                      sum((test_f$CVD09 - mean(test_f$CVD09))^2)
+
+cat("MLR baseline         — RMSE:", round(mlr_rmse,       3), "| R2:", round(mlr_r2,       3), "\n")
+cat("MLR + stratification — RMSE:", round(mlr_strat_rmse, 3), "| R2:", round(mlr_strat_r2, 3), "\n")
+```
+
+## Ridge with Stratification
+
+```{r strat-ridge}
+set.seed(160)
+cv_ridge_strat   <- cv.glmnet(X_train_strat, y_train, alpha = 0, nfolds = 10)
+ridge_strat_pred <- predict(cv_ridge_strat, newx = X_test_strat, s = "lambda.min")
+
+ridge_strat_rmse <- sqrt(mean((ridge_strat_pred - y_test)^2))
+ridge_strat_r2   <- 1 - sum((ridge_strat_pred - y_test)^2) /
+                        sum((y_test - mean(y_test))^2)
+
+cat("Ridge baseline         — RMSE:", round(ridge_rmse,       3), "| R2:", round(ridge_r2,       3), "\n")
+cat("Ridge + stratification — RMSE:", round(ridge_strat_rmse, 3), "| R2:", round(ridge_strat_r2, 3), "\n")
+```
+
+## Random Forest with Stratification
+
+```{r strat-rf}
+rf_strat_formula <- as.formula(paste(
+  "CVD09_range ~",
+  paste(c(feature_cols_no_cvd08, "LocationAbbr", "Stratification1"), collapse = " + ")
+))
+set.seed(160)
+rf_strat_model    <- randomForest(rf_strat_formula, data = train_rf_f, ntree = 500)
+rf_strat_pred     <- predict(rf_strat_model, newdata = test_rf_f)
+rf_strat_accuracy <- mean(rf_strat_pred == test_rf_f$CVD09_range)
+
+cat("RF baseline          — Accuracy:", round(rf_accuracy,       3), "\n")
+cat("RF + stratification  — Accuracy:", round(rf_strat_accuracy, 3), "\n")
+```
+
+## Comparison
+
+```{r strat-comparison}
+reg_strat_comp <- data.frame(
+  Model = c("MLR", "MLR + Strat", "Ridge", "Ridge + Strat"),
+  RMSE  = c(mlr_rmse,   mlr_strat_rmse,   ridge_rmse,   ridge_strat_rmse),
+  R2    = c(mlr_r2,     mlr_strat_r2,     ridge_r2,     ridge_strat_r2)
+)
+cat("Regression models:\n")
+print(reg_strat_comp)
+
+cat("\nRandom Forest:\n")
+cat("  Baseline:        ", round(rf_accuracy,       3), "\n")
+cat("  + Stratification:", round(rf_strat_accuracy, 3), "\n")
+
+ggplot(reg_strat_comp, aes(x = Model, y = RMSE, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  labs(
+    title = "RMSE — Baseline vs With Stratification",
+    x     = NULL,
+    y     = "RMSE (deaths per 100k)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+
+ggplot(reg_strat_comp, aes(x = Model, y = R2, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  labs(
+    title = "R-Squared — Baseline vs With Stratification",
+    x     = NULL,
+    y     = "R-Squared"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+
+rf_strat_acc_df <- data.frame(
+  Model    = c("RF Baseline", "RF + Stratification"),
+  Accuracy = c(rf_accuracy, rf_strat_accuracy)
+)
+ggplot(rf_strat_acc_df, aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  ylim(0, 1) +
+  labs(
+    title = "Random Forest Accuracy — Baseline vs With Stratification",
+    x     = NULL,
+    y     = "Accuracy"
+  ) +
+  theme_minimal()
+```

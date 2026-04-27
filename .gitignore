@@ -7,3 +7,4 @@ U.S._Chronic_Disease_Indicators.csv
 *.csv
 CLAUDE.md
 .claude/
+.RData*
