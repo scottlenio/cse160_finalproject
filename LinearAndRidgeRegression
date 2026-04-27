@@ -5,3 +5,187 @@ date: "April 15, 2026"
 output: html_notebook
 ---
 
+## MULTIPLE LINEAR REGRESSION
+
+```{r mlr-model, dependson="train-test-split"}
+# Build formula dynamically from feature columns
+mlr_formula <- as.formula(paste("CVD09 ~", paste(feature_cols, collapse = " + ")))
+
+# Fit OLS model on training data
+mlr_model <- lm(mlr_formula, data = train)
+
+# Summary of coefficients
+summary(mlr_model)
+```
+
+```{r mlr-evaluate, dependson="mlr-model"}
+# Predictions on test set
+mlr_pred <- predict(mlr_model, newdata = test)
+
+# Evaluation metrics
+mlr_rmse <- sqrt(mean((mlr_pred - test$CVD09)^2))
+mlr_r2   <- 1 - sum((mlr_pred - test$CVD09)^2) / sum((test$CVD09 - mean(test$CVD09))^2)
+
+cat("--- Multiple Linear Regression ---\n")
+cat("RMSE: ", round(mlr_rmse, 3), "\n")
+cat("R²:   ", round(mlr_r2,   3), "\n")
+```
+
+```{r mlr-plots, dependson="mlr-evaluate"}
+# Residuals vs Fitted
+mlr_results <- data.frame(
+  Fitted    = mlr_pred,
+  Actual    = test$CVD09,
+  Residuals = test$CVD09 - mlr_pred
+)
+
+# Residuals vs Fitted plot
+ggplot(mlr_results, aes(x = Fitted, y = Residuals)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "MLR — Residuals vs Fitted",
+    x     = "Fitted Values",
+    y     = "Residuals"
+  ) +
+  theme_minimal()
+
+# Actual vs Predicted plot
+ggplot(mlr_results, aes(x = Actual, y = Fitted)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "MLR — Actual vs Predicted",
+    x     = "Actual CVD09",
+    y     = "Predicted CVD09"
+  ) +
+  theme_minimal()
+```
+
+
+## 6. RIDGE REGRESSION
+
+```{r ridge-setup, message=FALSE, dependson="train-test-split"}
+library(glmnet)
+
+# glmnet requires matrices, not data frames
+X_train <- as.matrix(train[, feature_cols])
+y_train <- train$CVD09
+
+X_test  <- as.matrix(test[, feature_cols])
+y_test  <- test$CVD09
+```
+
+```{r ridge-cv, dependson="ridge-setup"}
+# 10-fold cross-validation to find optimal lambda
+set.seed(160)
+cv_ridge <- cv.glmnet(
+  X_train, y_train,
+  alpha  = 0,       # alpha=0 means Ridge (alpha=1 would be Lasso)
+  nfolds = 10
+)
+
+# Plot CV error across lambda values
+plot(cv_ridge)
+title("Ridge — Cross-Validation Error vs Lambda", line = 3)
+
+cat("Optimal lambda (lambda.min): ", round(cv_ridge$lambda.min, 4), "\n")
+cat("1-SE lambda (lambda.1se):    ", round(cv_ridge$lambda.1se, 4), "\n")
+```
+
+```{r ridge-evaluate, dependson="ridge-cv"}
+# Predict on test set using optimal lambda
+ridge_pred <- predict(cv_ridge, newx = X_test, s = "lambda.min")
+
+# Evaluation metrics
+ridge_rmse <- sqrt(mean((ridge_pred - y_test)^2))
+ridge_r2   <- 1 - sum((ridge_pred - y_test)^2) / sum((y_test - mean(y_test))^2)
+
+cat("--- Ridge Regression ---\n")
+cat("RMSE: ", round(ridge_rmse, 3), "\n")
+cat("R²:   ", round(ridge_r2,   3), "\n")
+```
+
+```{r ridge-coefficients, dependson="ridge-cv"}
+# Extract and display shrunken coefficients
+ridge_coefs <- coef(cv_ridge, s = "lambda.min")
+ridge_coef_df <- data.frame(
+  Feature     = rownames(ridge_coefs),
+  Coefficient = as.vector(ridge_coefs)
+) %>%
+  filter(Feature != "(Intercept)") %>%
+  arrange(desc(abs(Coefficient)))
+
+print(ridge_coef_df)
+
+# Plot top 15 coefficients by magnitude
+ridge_coef_df %>%
+  slice_head(n = 15) %>%
+  ggplot(aes(x = reorder(Feature, abs(Coefficient)), y = Coefficient)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Ridge — Top 15 Coefficients by Magnitude",
+    x     = "Feature",
+    y     = "Coefficient"
+  ) +
+  theme_minimal()
+```
+
+```{r ridge-plots, dependson="ridge-evaluate"}
+ridge_results <- data.frame(
+  Fitted    = as.vector(ridge_pred),
+  Actual    = y_test,
+  Residuals = y_test - as.vector(ridge_pred)
+)
+
+# Residuals vs Fitted
+ggplot(ridge_results, aes(x = Fitted, y = Residuals)) +
+  geom_point(alpha = 0.6, color = "darkorange") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Ridge — Residuals vs Fitted",
+    x     = "Fitted Values",
+    y     = "Residuals"
+  ) +
+  theme_minimal()
+
+# Actual vs Predicted
+ggplot(ridge_results, aes(x = Actual, y = Fitted)) +
+  geom_point(alpha = 0.6, color = "darkorange") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Ridge — Actual vs Predicted",
+    x     = "Actual CVD09",
+    y     = "Predicted CVD09"
+  ) +
+  theme_minimal()
+```
+
+
+## 7. MODEL COMPARISON
+
+```{r model-comparison, dependson=c("mlr-evaluate", "ridge-evaluate")}
+comparison <- data.frame(
+  Model = c("Multiple Linear Regression", "Ridge Regression"),
+  RMSE  = c(mlr_rmse, ridge_rmse),
+  R2    = c(mlr_r2,   ridge_r2)
+)
+
+print(comparison)
+
+# Bar chart comparison
+comparison_long <- comparison %>%
+  pivot_longer(cols = c(RMSE, R2), names_to = "Metric", values_to = "Value")
+
+ggplot(comparison_long, aes(x = Model, y = Value, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(
+    title = "Model Comparison — MLR vs Ridge",
+    x     = NULL,
+    y     = "Value"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
